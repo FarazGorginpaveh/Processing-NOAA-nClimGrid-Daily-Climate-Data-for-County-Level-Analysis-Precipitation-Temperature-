@@ -1,0 +1,338 @@
+# -*- coding: utf-8 -*-
+
+import os
+import re
+import tarfile
+import requests
+import pandas as pd
+import geopandas as gpd
+import xarray as xr
+from pathlib import Path
+from datetime import datetime
+from shapely.geometry import Point
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+BASE_URL = "https://www.ncei.noaa.gov/data/nclimgrid-daily/archive"
+
+TARGET_DATE = "2025-01-01"
+
+RAW_DIR = Path(r"D:\Flood_Data\Meteorological\nClimGrid_Daily_CONUS")
+EXTRACT_DIR = Path(r"D:\Flood_Data\Meteorological\nClimGrid_Extracted")
+OUTPUT_DIR = Path(r"D:\Flood_Data\Meteorological\County_Test")
+
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+COUNTY_SHP = r"D:\Flood_Data\Shapefiles\cb_2018_us_county_500k.shp"
+
+STATEFP_TO_KEEP = {
+    "01": "Alabama",
+    "12": "Florida",
+    "13": "Georgia",
+    "22": "Louisiana",
+    "28": "Mississippi",
+    "37": "North Carolina",
+    "45": "South Carolina",
+    "48": "Texas",
+}
+
+# ============================================================
+# FUNCTIONS
+# ============================================================
+
+def get_month_start_end(date_str):
+    dt = datetime.strptime(date_str, "%Y-%m-%d")
+    year = dt.year
+    month = dt.month
+
+    start_date = f"{year}{month:02d}01"
+
+    if month == 12:
+        next_month = datetime(year + 1, 1, 1)
+    else:
+        next_month = datetime(year, month + 1, 1)
+
+    last_day = (next_month - datetime.resolution).day
+    end_date = f"{year}{month:02d}{last_day:02d}"
+
+    return year, month, start_date, end_date
+
+
+def find_noaa_file(year, start_date, end_date):
+    index_url = f"{BASE_URL}/{year}/"
+    html = requests.get(index_url, timeout=60).text
+
+    search_start = (
+        f"nclimgrid-daily_v1-0-0_complete_"
+        f"s{start_date}_e{end_date}_c"
+    )
+
+    matches = []
+
+    for part in html.split('"'):
+        if part.startswith(search_start) and part.endswith(".tar.gz"):
+            matches.append(part)
+
+    if not matches:
+        raise FileNotFoundError(f"No NOAA file found for {start_date} to {end_date}")
+
+    filename = sorted(matches)[-1]
+    return index_url + filename, filename
+
+
+def download_file(url, out_path):
+    if out_path.exists() and out_path.stat().st_size > 0:
+        print(f"[SKIP] Already downloaded: {out_path.name}")
+        return
+
+    print(f"[DOWNLOADING] {url}")
+
+    with requests.get(url, stream=True, timeout=120) as r:
+        r.raise_for_status()
+
+        with open(out_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    f.write(chunk)
+
+    print(f"[OK] Downloaded: {out_path}")
+
+
+def extract_tar(tar_path, extract_dir):
+    extract_dir.mkdir(parents=True, exist_ok=True)
+
+    nc_files_existing = list(extract_dir.rglob("*.nc"))
+    if nc_files_existing:
+        print("[SKIP] Already extracted.")
+        return nc_files_existing
+
+    print(f"[EXTRACTING] {tar_path.name}")
+
+    with tarfile.open(tar_path, "r:gz") as tar:
+        tar.extractall(extract_dir)
+
+    nc_files = list(extract_dir.rglob("*.nc"))
+
+    if not nc_files:
+        raise FileNotFoundError("No NetCDF files found after extraction.")
+
+    print(f"[OK] Found {len(nc_files)} NetCDF files.")
+    return nc_files
+
+
+def get_lat_lon_names(ds):
+    if "lat" in ds.coords:
+        lat_name = "lat"
+    elif "latitude" in ds.coords:
+        lat_name = "latitude"
+    else:
+        raise ValueError("Latitude coordinate not found.")
+
+    if "lon" in ds.coords:
+        lon_name = "lon"
+    elif "longitude" in ds.coords:
+        lon_name = "longitude"
+    else:
+        raise ValueError("Longitude coordinate not found.")
+
+    return lat_name, lon_name
+
+
+def aggregate_one_netcdf_to_counties(nc_path, counties, target_date):
+    print(f"[PROCESSING] {nc_path.name}")
+
+    ds = xr.open_dataset(nc_path)
+
+    lat_name, lon_name = get_lat_lon_names(ds)
+
+    if "time" in ds.dims or "time" in ds.coords:
+        ds_day = ds.sel(time=pd.to_datetime(target_date), method="nearest")
+    else:
+        ds_day = ds
+
+    lats = ds_day[lat_name].values
+    lons_original = ds_day[lon_name].values.copy()
+    lons = lons_original.copy()
+
+    if lons.max() > 180:
+        lons = ((lons + 180) % 360) - 180
+
+    minx, miny, maxx, maxy = counties.total_bounds
+
+    lon_mask = (lons >= minx - 0.5) & (lons <= maxx + 0.5)
+    lat_mask = (lats >= miny - 0.5) & (lats <= maxy + 0.5)
+
+    lons_sub = lons[lon_mask]
+    lats_sub = lats[lat_mask]
+    lons_original_sub = lons_original[lon_mask]
+
+    points = []
+
+    for lat in lats_sub:
+        for lon in lons_sub:
+            points.append(Point(lon, lat))
+
+    grid_gdf = gpd.GeoDataFrame(
+        {
+            "grid_id": range(len(points)),
+            "lon": [p.x for p in points],
+            "lat": [p.y for p in points],
+        },
+        geometry=points,
+        crs="EPSG:4326"
+    )
+
+    joined = gpd.sjoin(
+        grid_gdf,
+        counties[["GEOID", "NAME", "STATEFP", "state_name", "geometry"]],
+        how="inner",
+        predicate="within"
+    )
+
+    if joined.empty:
+        print("[WARNING] No grid points matched counties.")
+        ds.close()
+        return None
+
+    results = joined[
+        ["grid_id", "GEOID", "NAME", "STATEFP", "state_name", "lon", "lat"]
+    ].copy()
+
+    for var in ds_day.data_vars:
+        data = ds_day[var]
+
+        if lat_name in data.dims and lon_name in data.dims:
+            data_sub = data.sel(
+                {
+                    lat_name: lats_sub,
+                    lon_name: lons_original_sub
+                }
+            )
+
+            values = data_sub.values.reshape(-1)
+
+            value_df = pd.DataFrame({
+                "grid_id": range(len(values)),
+                var: values
+            })
+
+            results = results.merge(value_df, on="grid_id", how="left")
+
+    ds.close()
+
+    value_cols = [
+        col for col in results.columns
+        if col not in [
+            "grid_id",
+            "GEOID",
+            "NAME",
+            "STATEFP",
+            "state_name",
+            "lon",
+            "lat",
+            "geometry"
+        ]
+    ]
+
+    agg_dict = {}
+
+    for col in value_cols:
+        if col.lower() == "prcp":
+            agg_dict[col] = "sum"
+        else:
+            agg_dict[col] = "mean"
+
+    county_agg = (
+        results
+        .groupby(["GEOID", "STATEFP", "state_name", "NAME"], as_index=False)
+        .agg(agg_dict)
+    )
+
+    return county_agg
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+year, month, start_date, end_date = get_month_start_end(TARGET_DATE)
+
+print("=" * 80)
+print(f"Target date: {TARGET_DATE}")
+print(f"Year-month file: {year}-{month:02d}")
+print("=" * 80)
+
+counties = gpd.read_file(COUNTY_SHP)
+counties = counties.to_crs("EPSG:4326")
+
+counties = counties[counties["STATEFP"].isin(STATEFP_TO_KEEP.keys())].copy()
+counties["state_name"] = counties["STATEFP"].map(STATEFP_TO_KEEP)
+
+print(f"Selected counties: {len(counties)}")
+print(counties[["STATEFP", "state_name", "NAME", "GEOID"]].head())
+
+file_url, filename = find_noaa_file(year, start_date, end_date)
+
+raw_year_dir = RAW_DIR / str(year)
+raw_year_dir.mkdir(exist_ok=True)
+
+tar_path = raw_year_dir / filename
+download_file(file_url, tar_path)
+
+extract_month_dir = EXTRACT_DIR / f"{year}_{month:02d}"
+nc_files = extract_tar(tar_path, extract_month_dir)
+
+all_outputs = []
+
+for nc_path in nc_files:
+    try:
+        county_df = aggregate_one_netcdf_to_counties(
+            nc_path,
+            counties,
+            TARGET_DATE
+        )
+
+        if county_df is not None:
+            all_outputs.append(county_df)
+
+    except Exception as e:
+        print(f"[ERROR] Failed for {nc_path.name}")
+        print(e)
+
+if not all_outputs:
+    raise RuntimeError("No county-level outputs were created.")
+
+final_df = all_outputs[0]
+
+for df in all_outputs[1:]:
+    final_df = final_df.merge(
+        df,
+        on=["GEOID", "STATEFP", "state_name", "NAME"],
+        how="outer"
+    )
+
+final_df = final_df.rename(columns={
+    "GEOID": "county_fips",
+    "NAME": "county"
+})
+
+final_df.insert(0, "date", TARGET_DATE)
+
+output_csv = OUTPUT_DIR / (
+    f"nclimgrid_county_{TARGET_DATE.replace('-', '_')}_"
+    f"southern_states_prcp_sum.csv"
+)
+
+final_df.to_csv(output_csv, index=False)
+
+print("\n====================================================")
+print("DONE")
+print("Saved county-level file:")
+print(output_csv)
+print("====================================================")
+
+print(final_df.head())
