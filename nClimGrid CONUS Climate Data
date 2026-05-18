@@ -1,3 +1,4 @@
+#Climate data - 4km grids
 import os
 import requests
 from pathlib import Path
