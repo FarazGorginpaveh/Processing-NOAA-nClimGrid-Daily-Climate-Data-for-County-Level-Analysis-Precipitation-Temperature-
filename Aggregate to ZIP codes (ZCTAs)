@@ -1,0 +1,257 @@
+"""
+Aggregate nClimGrid-Daily grids to ZIP codes (ZCTAs), area-weighted.
+--------------------------------------------------------------------
+For each ZCTA and each day:
+    tmax, tmin        area-weighted MEAN over the grid cells it overlaps  (degC)
+    prcp              area-weighted MEAN depth                            (mm)
+    prcp_volume_m3    that depth x the ZCTA's land area                   (m3)
+
+Weighting: exact fractional overlap between each grid cell and each ZCTA polygon,
+computed once in an equal-area projection (EPSG:5070 CONUS Albers) and cached.
+Grid cells that are NaN (outside the CONUS land mask -- matters a lot on the
+Louisiana coast) are dropped and the remaining weights renormalized per ZCTA,
+so a partly-offshore ZIP still gets a valid value from its land cells.
+
+Shared-mount safe: netCDF files are copied to local disk before opening.
+
+    pip install geopandas shapely pyproj scipy pandas xarray netCDF4 pyarrow
+"""
+
+import os
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"   # before netCDF4 loads
+
+import shutil
+from pathlib import Path
+
+import geopandas as gpd
+import numpy as np
+import pandas as pd
+import xarray as xr
+from scipy import sparse
+from shapely.geometry import box
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+SHARE = Path("/icebox/data/shares/mh1/fgorginpaveh/Tuft/Climate Data")
+NC_DIR = SHARE / "subset_louisiana"
+ZCTA_SHP = SHARE / "US Zipcode Shapefile" / "tl_2022_us_zcta520.shp"
+
+SCRATCH = Path("/bighome/fgorginpaveh/nclim_scratch")
+
+OUT_DIR = SHARE / "zcta_daily_louisiana"
+WEIGHTS_CACHE = SCRATCH / "zcta_grid_weights_louisiana.parquet"
+
+EQUAL_AREA = 5070          # EPSG:5070 NAD83 / Conus Albers -- areas in m^2
+GRID_RES = 1.0 / 24.0      # nClimGrid-Daily cell size, degrees
+
+VARS = ["tmax", "tmin", "prcp"]
+
+# Only keep ZCTAs whose centroid is inside the clipped domain, with a small
+# buffer so edge ZIPs aren't dropped.
+BBOX = (28.80, 33.10, -94.15, -88.70)   # lat_min, lat_max, lon_min, lon_max
+
+# A ZCTA on the domain edge may be only partly covered by the grid. Drop any
+# whose covered fraction falls below this (0.5 = at least half inside).
+MIN_COVERAGE = 0.50
+
+# ============================================================
+
+
+def stage(path):
+    """Copy a netCDF from the share to local disk (HDF5 can't open it on /icebox)."""
+    SCRATCH.mkdir(parents=True, exist_ok=True)
+    dst = SCRATCH / Path(path).name
+    if not dst.exists() or dst.stat().st_size != Path(path).stat().st_size:
+        shutil.copy(path, dst)
+    return dst
+
+
+def grid_cells(ds):
+    """Grid cell polygons, one per (lat, lon), in EPSG:4326."""
+    lats = ds.lat.values
+    lons = ds.lon.values
+    h = GRID_RES / 2.0
+
+    lat_g, lon_g = np.meshgrid(lats, lons, indexing="ij")
+    lat_f = lat_g.ravel()
+    lon_f = lon_g.ravel()
+
+    polys = [box(x - h, y - h, x + h, y + h) for x, y in zip(lon_f, lat_f)]
+
+    return gpd.GeoDataFrame(
+        {"cell_id": np.arange(lat_f.size),        # row-major: matches .values.ravel()
+         "lat": lat_f, "lon": lon_f},
+        geometry=polys, crs="EPSG:4326",
+    )
+
+
+def valid_mask(ds):
+    """
+    Flat boolean mask of cells with real data.
+    A cell is valid if it is non-NaN on at least one day for every variable --
+    the NaN pattern is the CONUS land mask and is static in time.
+    """
+    m = np.ones((ds.sizes["lat"], ds.sizes["lon"]), dtype=bool)
+    for v in VARS:
+        m &= ds[v].notnull().any(dim="time").values
+    return m.ravel()
+
+
+def build_weights(ds):
+    """
+    Area-weighted overlap between grid cells and ZCTAs.
+    Returns a DataFrame: zcta, cell_id, weight (weights sum to 1 per ZCTA).
+    """
+    if WEIGHTS_CACHE.exists():
+        print(f"[W] using cached weights: {WEIGHTS_CACHE}")
+        return pd.read_parquet(WEIGHTS_CACHE)
+
+    lat_min, lat_max, lon_min, lon_max = BBOX
+
+    print("[W] reading ZCTA shapefile (national -- this takes a minute)...")
+    zc = gpd.read_file(ZCTA_SHP, bbox=(lon_min, lat_min, lon_max, lat_max))
+    zcol = "ZCTA5CE20" if "ZCTA5CE20" in zc.columns else "GEOID20"
+    zc = zc[[zcol, "geometry"]].rename(columns={zcol: "zcta"})
+    zc = zc[zc.is_valid | zc.geometry.buffer(0).is_valid]
+    zc["geometry"] = zc.geometry.buffer(0)      # repair any self-intersections
+    print(f"[W] {len(zc)} ZCTAs intersect the domain")
+
+    cells = grid_cells(ds)
+
+    # keep only cells with real data -- drops ocean/offshore cells
+    vm = valid_mask(ds)
+    cells = cells[vm[cells.cell_id.values]].copy()
+    print(f"[W] {len(cells)} valid grid cells (of {vm.size})")
+
+    print("[W] intersecting in equal-area projection...")
+    zc_ea = zc.to_crs(epsg=EQUAL_AREA)
+    ce_ea = cells.to_crs(epsg=EQUAL_AREA)
+    zc_ea["zcta_area_m2"] = zc_ea.geometry.area
+
+    inter = gpd.overlay(zc_ea, ce_ea, how="intersection", keep_geom_type=True)
+    inter["ov_area_m2"] = inter.geometry.area
+    inter = inter[inter.ov_area_m2 > 0]
+
+    # how much of each ZCTA is actually covered by valid grid cells
+    cov = inter.groupby("zcta")["ov_area_m2"].sum()
+    zarea = zc_ea.set_index("zcta")["zcta_area_m2"]
+    frac = (cov / zarea).dropna()
+
+    keep = frac[frac >= MIN_COVERAGE].index
+    dropped = len(frac) - len(keep)
+    if dropped:
+        print(f"[W] dropping {dropped} ZCTA(s) with <{MIN_COVERAGE:.0%} valid coverage")
+
+    inter = inter[inter.zcta.isin(keep)]
+
+    # renormalize so weights sum to 1 within each ZCTA
+    inter["weight"] = inter.ov_area_m2 / inter.groupby("zcta")["ov_area_m2"].transform("sum")
+
+    w = inter[["zcta", "cell_id", "weight"]].copy()
+    w = w.merge(zarea.rename("zcta_area_m2"), left_on="zcta", right_index=True)
+
+    WEIGHTS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    w.to_parquet(WEIGHTS_CACHE, index=False)
+    print(f"[W] {len(w)} cell-ZCTA pairs across {w.zcta.nunique()} ZCTAs "
+          f"-> cached at {WEIGHTS_CACHE}")
+    return w
+
+
+def weight_matrix(w, n_cells):
+    """Sparse (n_zcta x n_cells) matrix, plus the zcta index and their areas."""
+    zctas = np.sort(w.zcta.unique())
+    zidx = {z: i for i, z in enumerate(zctas)}
+    rows = w.zcta.map(zidx).values
+    cols = w.cell_id.values
+    M = sparse.csr_matrix((w.weight.values, (rows, cols)),
+                          shape=(len(zctas), n_cells))
+    areas = (w.drop_duplicates("zcta").set_index("zcta")["zcta_area_m2"]
+             .reindex(zctas).values)
+    return M, zctas, areas
+
+
+def aggregate_file(nc_path, M, zctas, areas):
+    """One monthly file -> long DataFrame (zcta, date, tmax, tmin, prcp, prcp_volume_m3)."""
+    with xr.open_dataset(stage(nc_path)) as ds:
+        times = pd.to_datetime(ds.time.values)
+        n_cells = ds.sizes["lat"] * ds.sizes["lon"]
+        out = {}
+
+        for v in VARS:
+            # (time, lat, lon) -> (time, cell); NaN -> 0 with a renormalizing denominator,
+            # so any cell missing on a given day is excluded from that day's average
+            arr = ds[v].values.reshape(len(times), n_cells)
+            good = np.isfinite(arr)
+            filled = np.where(good, arr, 0.0)
+
+            num = M.dot(filled.T).T                    # (time, zcta)
+            den = M.dot(good.astype(float).T).T        # weight actually used
+            with np.errstate(invalid="ignore", divide="ignore"):
+                out[v] = np.where(den > 0, num / den, np.nan)
+
+    df = pd.DataFrame({
+        "zcta": np.repeat(zctas, len(times)),
+        "date": np.tile(times, len(zctas)),
+        "tmax": out["tmax"].T.ravel(),
+        "tmin": out["tmin"].T.ravel(),
+        "prcp": out["prcp"].T.ravel(),
+    })
+    df["tavg"] = (df.tmax + df.tmin) / 2.0
+    # depth (mm) -> volume (m3): mm/1000 * area_m2
+    area_map = pd.Series(areas, index=zctas)
+    df["prcp_volume_m3"] = df.prcp / 1000.0 * df.zcta.map(area_map)
+
+    return df.sort_values(["zcta", "date"]).reset_index(drop=True)
+
+
+def main():
+    files = sorted(NC_DIR.glob("ncdd-*.nc"))
+    if not files:
+        raise FileNotFoundError(f"No clipped netCDFs in {NC_DIR}")
+    print(f"Found {len(files)} monthly file(s): "
+          f"{files[0].name} .. {files[-1].name}\n")
+
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # weights depend only on the grid geometry -- build once from the first file
+    with xr.open_dataset(stage(files[0])) as ds0:
+        w = build_weights(ds0)
+        n_cells = ds0.sizes["lat"] * ds0.sizes["lon"]
+
+    M, zctas, areas = weight_matrix(w, n_cells)
+    print(f"\nWeight matrix: {M.shape[0]} ZCTAs x {M.shape[1]} cells, "
+          f"{M.nnz} nonzero\n")
+
+    parts = []
+    for i, f in enumerate(files, 1):
+        df = aggregate_file(f, M, zctas, areas)
+        print(f"[{i}/{len(files)}] {f.name}: {len(df):,} rows "
+              f"({df.date.min():%Y-%m-%d} .. {df.date.max():%Y-%m-%d})", flush=True)
+        parts.append(df)
+
+    full = pd.concat(parts, ignore_index=True).sort_values(["zcta", "date"])
+
+    # write locally, then plain-copy to the share
+    local_pq = SCRATCH / "zcta_daily.parquet"
+    local_csv = SCRATCH / "zcta_daily.csv"
+    full.to_parquet(local_pq, index=False)
+    full.to_csv(local_csv, index=False)
+
+    shutil.copy(local_pq, OUT_DIR / "zcta_daily.parquet")
+    shutil.copy(local_csv, OUT_DIR / "zcta_daily.csv")
+
+    print("\n" + "=" * 60)
+    print(f"{len(full):,} rows | {full.zcta.nunique()} ZCTAs | "
+          f"{full.date.min():%Y-%m-%d} .. {full.date.max():%Y-%m-%d}")
+    print(f"NaNs: " + ", ".join(f"{c}={int(full[c].isna().sum())}"
+                                for c in ['tmax', 'tmin', 'prcp']))
+    print(f"-> {OUT_DIR}")
+    print("=" * 60)
+    print("\nSample:")
+    print(full.head(10).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
