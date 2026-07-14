@@ -1,0 +1,251 @@
+#Climate data - nClimGrid-Daily, subset to Louisiana, 2000-2022
+#Variables kept: tmax, tmin, prcp
+#
+# Supports optional parallel downloads (MAX_WORKERS > 1) for use on
+# machines/clusters with more bandwidth (e.g. HPC). Keep MAX_WORKERS
+# modest (4-8) to avoid hammering NOAA's public server.
+
+import tarfile
+import requests
+import threading
+import calendar
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Requires: pip install requests xarray netCDF4
+import xarray as xr
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+BASE_URL = "https://www.ncei.noaa.gov/data/nclimgrid-daily/archive"
+
+OUTPUT_DIR = Path("/icebox/data/shares/mh1/fgorginpaveh/Tuft/Climate Data")
+RAW_TEMP_DIR = OUTPUT_DIR / "_raw_temp"          # scratch space, cleaned up as we go
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+RAW_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+START_YEAR = 2000
+END_YEAR = 2022
+
+# Louisiana bounding box (with a small buffer so edge grid cells aren't clipped)
+LAT_MIN, LAT_MAX = 28.7, 33.2
+LON_MIN, LON_MAX = -94.2, -88.6
+
+VARIABLES_TO_KEEP = ["tmax", "tmin", "prcp"]
+
+# Set to True if you also want to keep the full downloaded tarball and
+# extracted CONUS-wide netCDF (uses much more disk space).
+KEEP_RAW_FILES = False
+
+# Sequential = 1 (safe, slow, ~5-6 hrs for the full 2000-2022 range based on
+# observed ~75 sec/month locally). On an HPC node with better bandwidth,
+# try 4-8. Avoid going much higher - NOAA's archive is a shared public
+# server and aggressive parallelism risks throttling/timeouts for everyone.
+MAX_WORKERS = 1
+
+LOG_FILE = OUTPUT_DIR / "download_log.txt"
+FAILED_FILE = OUTPUT_DIR / "failed_downloads.txt"
+
+_log_lock = threading.Lock()
+_thread_local = threading.local()
+
+
+def log(msg):
+    with _log_lock:
+        print(msg, flush=True)
+        with open(LOG_FILE, "a") as f:
+            f.write(msg + "\n")
+
+
+def get_session():
+    # One requests.Session per thread so connections are pooled/reused
+    # within a thread, but threads don't share a non-thread-safe object.
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = requests.Session()
+    return _thread_local.session
+
+
+# ============================================================
+# DOWNLOAD FUNCTION
+# ============================================================
+
+def download_file(session, url, out_path):
+    if out_path.exists() and out_path.stat().st_size > 0:
+        log(f"[SKIP] Already exists: {out_path.name}")
+        return True
+
+    log(f"[DOWNLOADING] {url}")
+    try:
+        with session.get(url, stream=True, timeout=120) as r:
+            if r.status_code != 200:
+                log(f"[FAILED] HTTP {r.status_code}: {url}")
+                return False
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        log(f"[OK] Saved: {out_path.name}")
+        return True
+    except Exception as e:
+        log(f"[ERROR] {url}\n{e}")
+        return False
+
+
+# ============================================================
+# EXTRACT ONLY THE GRIDDED NETCDF FROM THE TARBALL
+# Stops decompressing as soon as the target member is found, instead of
+# building a full member list first (tf.getmembers() would force a full
+# sequential decompression pass through the whole tarball up front).
+# ============================================================
+
+def extract_grid_netcdf(tar_path, extract_dir):
+    with tarfile.open(tar_path, "r:gz") as tf:
+        for member in tf:
+            name = member.name.lower()
+            if name.endswith(".nc") and "grd" in name and "obcounts" not in name:
+                tf.extract(member, path=extract_dir, filter="data")
+                return extract_dir / member.name
+    return None
+
+
+# ============================================================
+# SUBSET TO LOUISIANA AND SAVE
+# ============================================================
+
+def subset_to_louisiana(nc_path, out_path):
+    ds = xr.open_dataset(nc_path)
+
+    lat_name = "lat" if "lat" in ds.coords else "latitude"
+    lon_name = "lon" if "lon" in ds.coords else "longitude"
+
+    lat_vals = ds[lat_name].values
+    if lat_vals[0] > lat_vals[-1]:
+        lat_slice = slice(LAT_MAX, LAT_MIN)
+    else:
+        lat_slice = slice(LAT_MIN, LAT_MAX)
+
+    ds_sub = ds.sel({lat_name: lat_slice, lon_name: slice(LON_MIN, LON_MAX)})
+
+    keep_vars = [v for v in VARIABLES_TO_KEEP if v in ds_sub.data_vars]
+    if not keep_vars:
+        ds.close()
+        return False
+
+    ds_sub = ds_sub[keep_vars]
+    encoding = {v: {"zlib": True, "complevel": 4} for v in keep_vars}
+    ds_sub.to_netcdf(out_path, encoding=encoding)
+
+    ds.close()
+    ds_sub.close()
+    return True
+
+
+# ============================================================
+# PROCESS ONE MONTH (download -> extract -> subset -> cleanup)
+# ============================================================
+
+def process_month(year, month):
+    year_out_dir = OUTPUT_DIR / str(year)
+    year_out_dir.mkdir(exist_ok=True)
+
+    start_date = f"{year}{month:02d}01"
+    last_day = calendar.monthrange(year, month)[1]
+    end_date = f"{year}{month:02d}{last_day:02d}"
+
+    final_out_path = year_out_dir / f"LA_tmax_tmin_prcp_{year}{month:02d}.nc"
+    if final_out_path.exists() and final_out_path.stat().st_size > 0:
+        log(f"[SKIP] Already processed: {final_out_path.name}")
+        return None
+
+    session = get_session()
+    index_url = f"{BASE_URL}/{year}/"
+
+    try:
+        html = session.get(index_url, timeout=60).text
+        search_start = f"nclimgrid-daily_v1-0-0_complete_s{start_date}_e{end_date}_c"
+        matches = [
+            part for part in html.split('"')
+            if part.startswith(search_start) and part.endswith(".tar.gz")
+        ]
+
+        if not matches:
+            log(f"[NOT FOUND] {year}-{month:02d}")
+            return f"{year}-{month:02d}"
+
+        filename = sorted(matches)[-1]
+        file_url = f"{index_url}{filename}"
+        tar_path = RAW_TEMP_DIR / f"{year}{month:02d}_{filename}"
+
+        ok = download_file(session, file_url, tar_path)
+        if not ok:
+            return file_url
+
+        nc_path = extract_grid_netcdf(tar_path, RAW_TEMP_DIR)
+        if nc_path is None:
+            log(f"[NO GRID FILE] {year}-{month:02d} - tarball had no matching .nc member")
+            if not KEEP_RAW_FILES and tar_path.exists():
+                tar_path.unlink()
+            return f"{year}-{month:02d} (no grid nc)"
+
+        success = subset_to_louisiana(nc_path, final_out_path)
+        if success:
+            log(f"[OK] Louisiana subset saved: {final_out_path.name}")
+            result = None
+        else:
+            log(f"[FAILED] Could not subset {year}-{month:02d}")
+            result = f"{year}-{month:02d} (subset failed)"
+
+        if not KEEP_RAW_FILES:
+            if nc_path.exists():
+                nc_path.unlink()
+            if tar_path.exists():
+                tar_path.unlink()
+
+        return result
+
+    except Exception as e:
+        log(f"[ERROR] Could not process {year}-{month:02d}\n{e}")
+        return f"{year}-{month:02d}"
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    tasks = [
+        (year, month)
+        for year in range(START_YEAR, END_YEAR + 1)
+        for month in range(1, 13)
+    ]
+
+    failed = []
+
+    if MAX_WORKERS <= 1:
+        for year, month in tasks:
+            result = process_month(year, month)
+            if result:
+                failed.append(result)
+    else:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(process_month, y, m): (y, m) for y, m in tasks}
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    failed.append(result)
+
+    with open(FAILED_FILE, "w") as f:
+        for item in failed:
+            f.write(str(item) + "\n")
+
+    print("\n====================================================")
+    print("DOWNLOAD FINISHED")
+    print(f"Output folder: {OUTPUT_DIR}")
+    print(f"Failed downloads saved to: {FAILED_FILE}")
+    print("====================================================")
+
+
+if __name__ == "__main__":
+    main()
